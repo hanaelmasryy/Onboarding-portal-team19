@@ -74,9 +74,42 @@ function validateTemplate(body) {
   return { value: { title: title.value, description: description.value, tasks } };
 }
 
-// Route ids must be positive whole numbers; anything else is treated as "not found".
-function parseId(raw) {
-  return /^[1-9][0-9]{0,9}$/.test(raw) ? Number(raw) : null;
+// Validates the body of PATCH /api/templates/:id/order: { taskIds: [3, 1, 2] }
+// (the template's task ids in their new order). Whether the list matches the
+// template's tasks exactly is checked against the database in the route.
+function validateOrder(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'Request body must be a JSON object' };
+  }
+  const ids = body.taskIds;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_TASKS) {
+    return { error: `taskIds must be a list of 1 to ${MAX_TASKS} task ids` };
+  }
+  if (!ids.every((id) => Number.isInteger(id) && id > 0)) {
+    return { error: 'taskIds must contain only positive whole numbers' };
+  }
+  if (new Set(ids).size !== ids.length) {
+    return { error: 'taskIds must not repeat a task' };
+  }
+  return { value: ids };
 }
 
-module.exports = { validateTemplate, parseId, VISIBILITY, ACTORS, MAX_TASKS };
+// Validates the optional body of POST /api/templates/:id/duplicate: { title? }.
+function validateDuplicate(body) {
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  return cleanText(source.title, { field: 'title', max: 150, required: false });
+}
+
+// Largest value a Postgres INTEGER (SERIAL) id can hold.
+const MAX_ID = 2147483647;
+
+// Route ids must be positive whole numbers that fit in an INTEGER column;
+// anything else is treated as "not found" (404). Without the upper limit,
+// /api/templates/9999999999 would reach Postgres and fail with a 500.
+function parseId(raw) {
+  if (typeof raw !== 'string' || !/^[1-9][0-9]{0,9}$/.test(raw)) return null;
+  const id = Number(raw);
+  return id <= MAX_ID ? id : null;
+}
+
+module.exports = { validateTemplate, validateOrder, validateDuplicate, parseId, MAX_ID, VISIBILITY, ACTORS, MAX_TASKS };

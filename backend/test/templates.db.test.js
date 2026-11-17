@@ -161,3 +161,120 @@ test('template changes are written to the audit log', { skip: SKIP }, async () =
   );
   assert.deepStrictEqual(rows.map((r) => r.action), ['template_create', 'template_archive']);
 });
+
+// ---- issue #7: search, reorder, duplicate -------------------------------------
+
+test('search finds templates by title or description, ignoring case', { skip: SKIP }, async () => {
+  const { body: created } = await createTemplate(sample({ title: `Searchable ${run}`, description: `KYC-${run} steps` }));
+  const byTitle = await request(app).get(`/api/templates?search=${encodeURIComponent(`searchable ${run}`)}`).set(as('Staff'));
+  assert.strictEqual(byTitle.status, 200);
+  assert.deepStrictEqual(byTitle.body.map((t) => t.id), [created.id]);
+  const byDescription = await request(app).get(`/api/templates?search=kyc-${run}`).set(as('Admin'));
+  assert.deepStrictEqual(byDescription.body.map((t) => t.id), [created.id]);
+
+  // Wildcards and SQL-looking text are just text: no error, no extra matches.
+  const percent = await request(app).get(`/api/templates?search=%25${run}`).set(as('Admin'));
+  assert.strictEqual(percent.status, 200);
+  assert.strictEqual(percent.body.length, 0);
+  const injection = await request(app).get(`/api/templates?search=${encodeURIComponent("' OR 1=1 --")}`).set(as('Admin'));
+  assert.strictEqual(injection.status, 200);
+  assert.strictEqual(injection.body.length, 0);
+
+  assert.strictEqual((await request(app).get(`/api/templates?search=${'x'.repeat(101)}`).set(as('Admin'))).status, 400);
+  assert.strictEqual((await request(app).get('/api/templates?search=x').set(as('Customer'))).status, 403);
+});
+
+test('search combines with status', { skip: SKIP }, async () => {
+  const { body: created } = await createTemplate(sample({ title: `Old ${run}` }));
+  await request(app).patch(`/api/templates/${created.id}/archive`).set(as('Admin'));
+  const active = await request(app).get(`/api/templates?search=${encodeURIComponent(`old ${run}`)}`).set(as('Admin'));
+  assert.strictEqual(active.body.length, 0);
+  const archived = await request(app).get(`/api/templates?search=${encodeURIComponent(`old ${run}`)}&status=archived`).set(as('Admin'));
+  assert.deepStrictEqual(archived.body.map((t) => t.id), [created.id]);
+});
+
+test('reorder puts tasks in the new order and increases the version', { skip: SKIP }, async () => {
+  const { body: created } = await createTemplate();
+  const [a, b, c] = created.tasks.map((t) => t.id);
+  const res = await request(app).patch(`/api/templates/${created.id}/order`).set(as('Admin')).send({ taskIds: [c, a, b] });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.version, 2);
+  assert.deepStrictEqual(res.body.tasks.map((t) => [t.id, t.position]), [[c, 1], [a, 2], [b, 3]]);
+  // Task rules travel with the task.
+  assert.strictEqual(res.body.tasks[0].visibility, 'internal');
+});
+
+test('reorder rejects a list that does not match the template tasks -> 400', { skip: SKIP }, async () => {
+  const { body: created } = await createTemplate();
+  const { body: other } = await createTemplate();
+  const [a, b, c] = created.tasks.map((t) => t.id);
+  const send = (taskIds) => request(app).patch(`/api/templates/${created.id}/order`).set(as('Admin')).send({ taskIds });
+  assert.strictEqual((await send([a, b])).status, 400); // missing one
+  assert.strictEqual((await send([a, b, c, other.tasks[0].id])).status, 400); // extra task
+  assert.strictEqual((await send([a, b, other.tasks[0].id])).status, 400); // task from another template
+  assert.strictEqual((await send([a, a, b])).status, 400); // repeated
+  // Nothing changed.
+  const { body: after } = await request(app).get(`/api/templates/${created.id}`).set(as('Admin'));
+  assert.deepStrictEqual(after.tasks.map((t) => t.id), [a, b, c]);
+  assert.strictEqual(after.version, 1);
+});
+
+test('reorder: archived -> 409, unknown -> 404, not Admin -> 403', { skip: SKIP }, async () => {
+  const { body: created } = await createTemplate();
+  const ids = created.tasks.map((t) => t.id);
+  assert.strictEqual((await request(app).patch(`/api/templates/${created.id}/order`).set(as('Staff')).send({ taskIds: ids })).status, 403);
+  assert.strictEqual((await request(app).patch('/api/templates/999999999/order').set(as('Admin')).send({ taskIds: ids })).status, 404);
+  await request(app).patch(`/api/templates/${created.id}/archive`).set(as('Admin'));
+  assert.strictEqual((await request(app).patch(`/api/templates/${created.id}/order`).set(as('Admin')).send({ taskIds: ids })).status, 409);
+});
+
+test('duplicate copies the template and its task rules as a new active template', { skip: SKIP }, async () => {
+  const { body: source } = await createTemplate();
+  const res = await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Admin'));
+  assert.strictEqual(res.status, 201);
+  templateIds.push(res.body.id);
+  assert.notStrictEqual(res.body.id, source.id);
+  assert.strictEqual(res.body.title, `Copy of ${source.title}`);
+  assert.strictEqual(res.body.status, 'active');
+  assert.strictEqual(res.body.version, 1);
+  const rules = (t) => t.tasks.map((x) => [x.position, x.title, x.offsetDays, x.visibility, x.actor]);
+  assert.deepStrictEqual(rules(res.body), rules(source));
+  // New task rows, not shared with the source.
+  assert.ok(res.body.tasks.every((t) => !source.tasks.some((s) => s.id === t.id)));
+});
+
+test('duplicate accepts a new title and works on archived templates', { skip: SKIP }, async () => {
+  const { body: source } = await createTemplate();
+  await request(app).patch(`/api/templates/${source.id}/archive`).set(as('Admin'));
+  const res = await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Admin')).send({ title: `Revived ${run}` });
+  assert.strictEqual(res.status, 201);
+  templateIds.push(res.body.id);
+  assert.strictEqual(res.body.title, `Revived ${run}`);
+  assert.strictEqual(res.body.status, 'active');
+});
+
+test('duplicate: unknown -> 404, not Admin -> 403, bad title -> 400', { skip: SKIP }, async () => {
+  const { body: source } = await createTemplate();
+  assert.strictEqual((await request(app).post('/api/templates/999999999/duplicate').set(as('Admin'))).status, 404);
+  assert.strictEqual((await request(app).post('/api/templates/abc/duplicate').set(as('Admin'))).status, 404);
+  assert.strictEqual((await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Staff'))).status, 403);
+  assert.strictEqual((await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Customer'))).status, 403);
+  assert.strictEqual((await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Admin')).send({ title: 'x'.repeat(151) })).status, 400);
+});
+
+test('reorder and duplicate are written to the audit log', { skip: SKIP }, async () => {
+  const { body: source } = await createTemplate();
+  const ids = source.tasks.map((t) => t.id).reverse();
+  await request(app).patch(`/api/templates/${source.id}/order`).set(as('Admin')).send({ taskIds: ids });
+  const { body: copy } = await request(app).post(`/api/templates/${source.id}/duplicate`).set(as('Admin'));
+  templateIds.push(copy.id);
+  const { rows } = await pool.db().query(
+    `SELECT action, entity_id FROM audit_log
+      WHERE action IN ('template_reorder', 'template_duplicate') AND entity_id = ANY($1) ORDER BY id`,
+    [[String(source.id), String(copy.id)]]
+  );
+  assert.deepStrictEqual(rows, [
+    { action: 'template_reorder', entity_id: String(source.id) },
+    { action: 'template_duplicate', entity_id: String(copy.id) },
+  ]);
+});

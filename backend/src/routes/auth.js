@@ -10,7 +10,10 @@
 //
 // Failed attempts are counted in the login_attempts table (serverless
 // memory is not shared between requests). Every login, failure and
-// lockout is written to the audit log.
+// lockout is written to the audit log. The audit log records the user id,
+// never the typed email: the read-only dashboard role can read the audit
+// log but is not allowed to see email addresses (least privilege).
+// Attempts on emails that don't exist are logged with no user.
 
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -85,7 +88,9 @@ router.post('/auth/login', async (req, res, next) => {
 
     const secondsLeft = await isLocked(email, ip);
     if (secondsLeft > 0) {
-      await recordAudit({ action: 'login_locked', entity: 'user', entityId: email, result: 'denied', ip });
+      const { rows: known } = await pool.db().query('SELECT id FROM users WHERE email = $1', [email]);
+      const userId = known[0] ? known[0].id : null;
+      await recordAudit({ actorId: userId, action: 'login_locked', entity: 'user', entityId: userId, result: 'denied', ip });
       res.set('Retry-After', String(secondsLeft));
       return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
     }
@@ -103,7 +108,7 @@ router.post('/auth/login', async (req, res, next) => {
         actorId: user ? user.id : null,
         action: user && passwordOk && !user.active ? 'login_inactive' : 'login_failed',
         entity: 'user',
-        entityId: email,
+        entityId: user ? user.id : null,
         result: 'denied',
         ip,
       });

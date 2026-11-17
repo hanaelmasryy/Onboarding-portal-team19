@@ -73,3 +73,43 @@ test('route ids must be positive whole numbers', () => {
     assert.strictEqual(parseId(bad), null, `id ${bad}`);
   }
 });
+
+test('route ids above the database INTEGER limit are "not found", not a server error', () => {
+  assert.strictEqual(parseId('2147483647'), 2147483647);
+  assert.strictEqual(parseId('2147483648'), null);
+  assert.strictEqual(parseId('9999999999'), null);
+  assert.strictEqual(parseId(undefined), null);
+});
+
+// ---- issue #7: reorder and duplicate input -----------------------------------
+const { validateOrder, validateDuplicate } = require('../src/lib/templateRules');
+const { searchPattern } = require('../src/lib/search');
+
+test('reorder body must be a list of unique positive task ids', () => {
+  assert.deepStrictEqual(validateOrder({ taskIds: [3, 1, 2] }).value, [3, 1, 2]);
+  assert.match(validateOrder({}).error, /taskIds/);
+  assert.match(validateOrder({ taskIds: [] }).error, /taskIds/);
+  assert.match(validateOrder({ taskIds: [1, 1] }).error, /repeat/);
+  assert.match(validateOrder({ taskIds: [1, '2'] }).error, /whole numbers/);
+  assert.match(validateOrder({ taskIds: [0] }).error, /whole numbers/);
+  assert.match(validateOrder({ taskIds: Array.from({ length: 101 }, (_, i) => i + 1) }).error, /1 to 100/);
+  assert.match(validateOrder([1, 2]).error, /JSON object/);
+});
+
+test('duplicate title is optional, trimmed and limited to 150 characters', () => {
+  assert.strictEqual(validateDuplicate(undefined).value, null);
+  assert.strictEqual(validateDuplicate({}).value, null);
+  assert.strictEqual(validateDuplicate({ title: '  New name ' }).value, 'New name');
+  assert.match(validateDuplicate({ title: 'x'.repeat(151) }).error, /150/);
+  assert.match(validateDuplicate({ title: 42 }).error, /text/);
+});
+
+test('search text becomes a safe pattern: % and _ are matched literally', () => {
+  assert.strictEqual(searchPattern(undefined).value, null);
+  assert.strictEqual(searchPattern('   ').value, null);
+  assert.strictEqual(searchPattern(' kyc ').value, '%kyc%');
+  assert.strictEqual(searchPattern('50%_off').value, '%50\\%\\_off%');
+  assert.strictEqual(searchPattern("' OR 1=1 --").value, "%' OR 1=1 --%");
+  assert.match(searchPattern('x'.repeat(101)).error, /100/);
+  assert.match(searchPattern(['a', 'b']).error, /text/);
+});
