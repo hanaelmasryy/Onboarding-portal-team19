@@ -91,7 +91,7 @@ router.get('/dashboard/plans', requireAuth, requireRole('Admin', 'Staff'), async
               COUNT(t.id) FILTER (WHERE t.status = 'Done')::int           AS done_tasks,
               COUNT(t.id) FILTER (WHERE t.status <> 'Done'
                                     AND t.due_date < CURRENT_DATE)::int   AS overdue_tasks,
-                     to_char(MIN(t.due_date) FILTER (WHERE t.status <> 'Done'), 'YYYY-MM-DD') AS next_due_date
+              MIN(t.due_date) FILTER (WHERE t.status <> 'Done')           AS next_due_date
          FROM onboarding_plans p
          JOIN users u      ON u.id = p.customer_id
          LEFT JOIN tasks t ON t.plan_id = p.id
